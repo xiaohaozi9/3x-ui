@@ -95,12 +95,20 @@ func (a *XraySettingController) getXraySetting(c *gin.Context) {
 
 // updateSetting updates the Xray configuration settings.
 func (a *XraySettingController) updateSetting(c *gin.Context) {
-	xraySetting := c.PostForm("xraySetting")
+	var req struct {
+		XraySetting     string `json:"xraySetting" form:"xraySetting"`
+		OutboundTestUrl string `json:"outboundTestUrl" form:"outboundTestUrl"`
+	}
+	_ = c.ShouldBind(&req)
+	if req.XraySetting == "" {
+		_ = c.ShouldBindJSON(&req)
+	}
+	xraySetting := req.XraySetting
 	if err := a.XraySettingService.SaveXraySetting(xraySetting); err != nil {
 		jsonMsg(c, I18nWeb(c, "pages.settings.toasts.modifySettings"), err)
 		return
 	}
-	outboundTestUrl := c.PostForm("outboundTestUrl")
+	outboundTestUrl := req.OutboundTestUrl
 	if outboundTestUrl == "" {
 		outboundTestUrl = "https://www.google.com/generate_204"
 	}
