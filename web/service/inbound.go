@@ -1652,23 +1652,24 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 				continue
 			}
 			newIb := model.Inbound{
-				UserId:         defaultUserId,
-				NodeID:         &nodeID,
-				OriginNodeGuid: originGuidFor(snapIb),
-				Tag:            chosenTag,
-				Listen:         snapIb.Listen,
-				Port:           snapIb.Port,
-				Protocol:       snapIb.Protocol,
-				Settings:       snapIb.Settings,
-				StreamSettings: snapIb.StreamSettings,
-				Sniffing:       snapIb.Sniffing,
-				TrafficReset:   snapIb.TrafficReset,
-				Enable:         snapIb.Enable,
-				Remark:         snapIb.Remark,
-				Total:          snapIb.Total,
-				ExpiryTime:     snapIb.ExpiryTime,
-				Up:             snapIb.Up,
-				Down:           snapIb.Down,
+				UserId:               defaultUserId,
+				NodeID:               &nodeID,
+				OriginNodeGuid:       originGuidFor(snapIb),
+				Tag:                  chosenTag,
+				Listen:               snapIb.Listen,
+				Port:                 snapIb.Port,
+				Protocol:             snapIb.Protocol,
+				Settings:             snapIb.Settings,
+				StreamSettings:       snapIb.StreamSettings,
+				Sniffing:             snapIb.Sniffing,
+				TrafficReset:         snapIb.TrafficReset,
+				LastTrafficResetTime: snapIb.LastTrafficResetTime,
+				Enable:               snapIb.Enable,
+				Remark:               snapIb.Remark,
+				Total:                snapIb.Total,
+				ExpiryTime:           snapIb.ExpiryTime,
+				Up:                   snapIb.Up,
+				Down:                 snapIb.Down,
 			}
 			if err := tx.Create(&newIb).Error; err != nil {
 				logger.Warningf("setRemoteTraffic: create central inbound for tag %q failed: %v", snapIb.Tag, err)
@@ -1697,6 +1698,7 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 			updates["stream_settings"] = snapIb.StreamSettings
 			updates["sniffing"] = snapIb.Sniffing
 			updates["traffic_reset"] = snapIb.TrafficReset
+			updates["last_traffic_reset_time"] = snapIb.LastTrafficResetTime
 		}
 		if !inGrace || (snapIb.Up+snapIb.Down) <= (c.Up+c.Down) {
 			updates["up"] = snapIb.Up
@@ -1742,9 +1744,13 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 			return false, err
 		}
 		if len(goneEmails) > 0 {
-			if err := tx.Where("node_id = ? AND email IN ?", nodeID, goneEmails).
-				Delete(&model.NodeClientTraffic{}).Error; err != nil {
-				return false, err
+			// Chunk to avoid SQLite bind var limit when a node has many clients
+			// removed (e.g. after API bulk delete or structural change on node inbound).
+			for _, batch := range chunkStrings(goneEmails, sqliteMaxVars) {
+				if err := tx.Where("node_id = ? AND email IN ?", nodeID, batch).
+					Delete(&model.NodeClientTraffic{}).Error; err != nil {
+					return false, err
+				}
 			}
 		}
 		if err := tx.Where("inbound_id = ?", c.Id).
@@ -1828,7 +1834,11 @@ func (s *InboundService) setRemoteTrafficLocked(nodeID int, snap *runtime.Traffi
 			// from the node arriving after a central disable would otherwise
 			// overwrite enable=false back to true, letting the client accumulate
 			// far more traffic than their limit before being disabled again.
-			enableExpr := "enable AND ?"
+			//
+			// Use dialect helper so the expression (and internal PG CASE from
+			// AND/GREATEST) is type-safe on Postgres and works on SQLite.
+			// See ClientTrafficEnableMergeExpr.
+			enableExpr := database.ClientTrafficEnableMergeExpr()
 			if err := tx.Exec(
 				fmt.Sprintf(
 					`UPDATE client_traffics
@@ -3643,7 +3653,7 @@ func (s *InboundService) MigrationRequirements() {
 	var externalProxy []struct {
 		Id             int
 		Port           int
-		StreamSettings []byte
+		StreamSettings string // text column on both DBs; safer than []byte for cross-DB scan
 	}
 	externalProxyQuery := `select id, port, stream_settings
 	from inbounds
@@ -3665,7 +3675,7 @@ func (s *InboundService) MigrationRequirements() {
 	for _, ep := range externalProxy {
 		var reverses any
 		var stream map[string]any
-		json.Unmarshal(ep.StreamSettings, &stream)
+		json.Unmarshal([]byte(ep.StreamSettings), &stream)
 		if tlsSettings, ok := stream["tlsSettings"].(map[string]any); ok {
 			if settings, ok := tlsSettings["settings"].(map[string]any); ok {
 				if domains, ok := settings["domains"].([]any); ok {
@@ -3687,9 +3697,17 @@ func (s *InboundService) MigrationRequirements() {
 		tx.Model(model.Inbound{}).Where("id = ?", ep.Id).Update("stream_settings", newStream)
 	}
 
-	err = tx.Raw(`UPDATE inbounds
-	SET tag = REPLACE(tag, '0.0.0.0:', '')
-	WHERE INSTR(tag, '0.0.0.0:') > 0;`).Error
+	// Legacy tag cleanup for old auto-generated tags (e.g. "0.0.0.0:443-...").
+	// Must be cross-DB: INSTR/REPLACE work on SQLite; Postgres needs position().
+	tagCleanup := `UPDATE inbounds
+		SET tag = REPLACE(tag, '0.0.0.0:', '')
+		WHERE INSTR(tag, '0.0.0.0:') > 0;`
+	if database.IsPostgres() {
+		tagCleanup = `UPDATE inbounds
+			SET tag = REPLACE(tag, '0.0.0.0:', '')
+			WHERE position('0.0.0.0:' in tag) > 0;`
+	}
+	err = tx.Raw(tagCleanup).Error
 	if err != nil {
 		return
 	}
